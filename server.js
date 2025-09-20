@@ -4,67 +4,63 @@ import cors from "cors";
 import nacl from "tweetnacl";
 import bs58 from "bs58";
 import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
-// === ENV ===
-// Pon estas variables en tu entorno (Railway/Render/.env):
-// SUPABASE_URL=...
-// SUPABASE_SERVICE_ROLE=...  (o ANON si solo haces SELECT con RLS correcto)
-// PORT=3000
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE, PORT = 3000 } = process.env;
+// CORS (restringe si quieres con tu dominio del front)
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+app.use(cors({ origin: ALLOWED_ORIGIN }));
 
+// Supabase
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE } = process.env;
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-  console.warn("⚠️  Faltan variables SUPABASE_URL o SUPABASE_SERVICE_ROLE");
+  console.error("❌ Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE");
+  process.exit(1);
 }
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-// Util simple para generar nonce
-function genNonce(len = 16) {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let out = "";
-  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
-  return out;
+// Utils
+function genNonce(len = 24) {
+  return crypto.randomBytes(len).toString("base64url");
 }
 
-// Ruta para pedir nonce (y mensaje a firmar)
-app.get("/auth/nonce", (req, res) => {
+// Healthcheck
+app.get("/healthz", (_req, res) => res.send("ok"));
+
+// Nonce + mensaje a firmar
+app.get("/auth/nonce", (_req, res) => {
   const nonce = genNonce();
+  const now = new Date().toISOString();
   const message =
     `Inicia sesión con tu wallet (SIWS)\n` +
-    `Dominio: demo-login\n` +
+    `Dominio: auth-backend\n` +
+    `Fecha: ${now}\n` +
     `Nonce: ${nonce}\n` +
-    `Fecha: ${new Date().toISOString()}\n` +
     `\nAl firmar confirmas que controlas esta wallet.`;
   res.json({ nonce, message });
 });
 
-// Ruta para verificar firma y chequear registro
+// Verificar firma y comprobar en Supabase
 app.post("/auth/verify", async (req, res) => {
   try {
     const { publicKey, signature, message } = req.body;
     if (!publicKey || !signature || !message) {
-      return res.status(400).json({ error: "Faltan campos publicKey/signature/message" });
+      return res.status(400).json({ error: "Faltan publicKey/signature/message" });
     }
 
-    // Verificar firma con tweetnacl
-    // signature llega como array (desde el front). Convertimos a Uint8Array:
-    const sigUint8 = new Uint8Array(signature);
-    const msgUint8 = new TextEncoder().encode(message);
-    const pubKeyUint8 = bs58.decode(publicKey);
+    const sigUint8 = new Uint8Array(signature);           // Array -> Uint8Array
+    const msgUint8 = new TextEncoder().encode(message);   // string -> bytes
+    const pubKeyUint8 = bs58.decode(publicKey);           // base58 -> bytes
 
     const ok = nacl.sign.detached.verify(msgUint8, sigUint8, pubKeyUint8);
-    if (!ok) {
-      return res.status(401).json({ error: "Firma inválida" });
-    }
+    if (!ok) return res.status(401).json({ error: "Firma inválida" });
 
-    // Si la firma es válida, comprobamos si la wallet existe en Supabase
-    const { data, error } = await supabase
+    // Buscar usuario por wallet
+    const { data: user, error } = await supabase
       .from("users")
-      .select("id")
+      .select("id, name, handle, image_url")
       .eq("wallet", publicKey)
       .maybeSingle();
 
@@ -73,14 +69,16 @@ app.post("/auth/verify", async (req, res) => {
       return res.status(500).json({ error: "Error consultando Supabase" });
     }
 
-    const registered = !!data;
-    return res.json({ registered });
+    if (!user) return res.json({ registered: false });
+    return res.json({ registered: true, profile: user });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Error interno" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Auth server escuchando en http://localhost:${PORT}`);
-});
+// Escuchar SIEMPRE en 0.0.0.0 y en el PORT que da Railway
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`✅ Auth backend escuchando en :${PORT}`)
+);
