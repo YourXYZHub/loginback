@@ -1,10 +1,8 @@
 {
-  "name": "solana-phantom-login",
+  "name": "auth-backend",
   "type": "module",
-  "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "NODE_ENV=development node server.js"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=20"
