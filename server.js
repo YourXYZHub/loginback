@@ -1,84 +1,81 @@
-// server.js
-import express from "express";
-import cors from "cors";
-import nacl from "tweetnacl";
-import bs58 from "bs58";
-import { createClient } from "@supabase/supabase-js";
-import crypto from "crypto";
+const express = require('express');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const { Connection, PublicKey, clusterApiUrl } = require('@solana/web3.js');
+const nacl = require('tweetnacl');
+const bs58 = require('bs58');
+const { createClient } = require('@supabase/supabase-js');
+
+dotenv.config();
 
 const app = express();
+const port = process.env.PORT || 3001;
+
+// Middleware
+app.use(cors());
 app.use(express.json());
 
-// CORS (restringe si quieres con tu dominio del front)
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-app.use(cors({ origin: ALLOWED_ORIGIN }));
+// Supabase configuration
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Supabase
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE } = process.env;
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-  console.error("❌ Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE");
-  process.exit(1);
-}
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
+// Solana connection
+const connection = new Connection(clusterApiUrl('mainnet-beta'));
 
-// Utils
-function genNonce(len = 24) {
-  return crypto.randomBytes(len).toString("base64url");
-}
-
-// Healthcheck
-app.get("/healthz", (_req, res) => res.send("ok"));
-
-// Nonce + mensaje a firmar
-app.get("/auth/nonce", (_req, res) => {
-  const nonce = genNonce();
-  const now = new Date().toISOString();
-  const message =
-    `Inicia sesión con tu wallet (SIWS)\n` +
-    `Dominio: auth-backend\n` +
-    `Fecha: ${now}\n` +
-    `Nonce: ${nonce}\n` +
-    `\nAl firmar confirmas que controlas esta wallet.`;
-  res.json({ nonce, message });
+// Generate a nonce for signing
+app.get('/api/nonce', (req, res) => {
+  const nonce = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  const message = `Please sign this message to authenticate with our app. Nonce: ${nonce}, Timestamp: ${Date.now()}`;
+  
+  res.json({ message, nonce });
 });
 
-// Verificar firma y comprobar en Supabase
-app.post("/auth/verify", async (req, res) => {
+// Verify signature and check user in Supabase
+app.post('/api/verify', async (req, res) => {
+  const { publicKey, signature, message } = req.body;
+
   try {
-    const { publicKey, signature, message } = req.body;
-    if (!publicKey || !signature || !message) {
-      return res.status(400).json({ error: "Faltan publicKey/signature/message" });
+    // Verify the signature
+    const publicKeyBytes = new PublicKey(publicKey).toBytes();
+    const signatureBytes = bs58.decode(signature);
+    const messageBytes = new TextEncoder().encode(message);
+
+    const isValid = nacl.sign.detached.verify(
+      messageBytes,
+      signatureBytes,
+      publicKeyBytes
+    );
+
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    const sigUint8 = new Uint8Array(signature);           // Array -> Uint8Array
-    const msgUint8 = new TextEncoder().encode(message);   // string -> bytes
-    const pubKeyUint8 = bs58.decode(publicKey);           // base58 -> bytes
-
-    const ok = nacl.sign.detached.verify(msgUint8, sigUint8, pubKeyUint8);
-    if (!ok) return res.status(401).json({ error: "Firma inválida" });
-
-    // Buscar usuario por wallet
+    // Check if user exists in Supabase
     const { data: user, error } = await supabase
-      .from("users")
-      .select("id, name, handle, image_url")
-      .eq("wallet", publicKey)
-      .maybeSingle();
+      .from('users')
+      .select('id, name, handle, image_url, created_at')
+      .eq('wallet', publicKey)
+      .single();
 
     if (error) {
-      console.error(error);
-      return res.status(500).json({ error: "Error consultando Supabase" });
+      if (error.code === 'PGRST116') { // No rows returned
+        return res.json({ registered: false });
+      }
+      throw error;
     }
 
-    if (!user) return res.json({ registered: false });
-    return res.json({ registered: true, profile: user });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Error interno" });
+    res.json({
+      registered: true,
+      profile: user
+    });
+
+  } catch (error) {
+    console.error('Verification error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Escuchar SIEMPRE en 0.0.0.0 y en el PORT que da Railway
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () =>
-  console.log(`✅ Auth backend escuchando en :${PORT}`)
-);
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
